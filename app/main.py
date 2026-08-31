@@ -58,6 +58,10 @@ class RunResponse(BaseModel):
     specification: list[dict[str, Any]] = []
     explorer_findings: dict[str, Any] = {}
     evidence_report: dict[str, Any] = {}
+    adversary_findings: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    spec_iteration: int = 0
+    build_iteration: int = 0
 
 
 class RunStartedResponse(BaseModel):
@@ -99,6 +103,14 @@ async def _execute_pipeline(run_id: str, repo_path: str, request: str) -> None:
             "specification": result.specification,
             "explorer_findings": result.explorer_findings,
             "evidence_report": result.evidence_report,
+            "adversary_findings": result.adversary_findings,
+            "conflicts": result.conflicts,
+            "diff": result.implementation_diff or "",
+            "tests_passed": result.tests_passed,
+            "tests_failed": result.tests_failed,
+            "test_output": result.test_output,
+            "spec_iteration": result.spec_iteration,
+            "build_iteration": result.build_iteration,
             "error": result.error,
         }
         RUNS[run_id]["status"] = result.status
@@ -212,7 +224,16 @@ async def run_events(run_id: str) -> EventSourceResponse:
                     "event": event["type"],
                     "data": json.dumps(event),
                 }
-            if run["status"] in {"completed", "success", "failed"} and sent >= len(events):
+            if run["status"] in {
+                "completed",
+                "success",
+                "failed",
+                "spec_conflict",
+                "implementation_failed",
+                "max_iterations_reached",
+                "blocked",
+                "verification_failed",
+            } and sent >= len(events):
                 break
             idle_rounds += 1
             if idle_rounds > 1200:

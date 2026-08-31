@@ -45,8 +45,25 @@ def run_spec_detective(
     sandbox: Sandbox,
     emit: EventCallback,
     metrics: AgentMetrics,
+    *,
+    conflicts: list[dict[str, Any]] | None = None,
+    prior_specification: list[Requirement] | None = None,
+    spec_iteration: int = 1,
 ) -> list[Requirement]:
-    emit("agent_started", {"agent": "spec_detective"})
+    revising = bool(conflicts) or spec_iteration > 1
+    emit(
+        "agent_started",
+        {
+            "agent": "spec_detective",
+            "spec_iteration": spec_iteration,
+            "label": (
+                f"↻ Spec Detective (iteration {spec_iteration})"
+                if revising
+                else f"spec_detective (iteration {spec_iteration})"
+            ),
+            "revising": revising,
+        },
+    )
 
     evidence_snippets: dict[str, str] = {}
     paths = list(explorer_findings.get("relevant_files") or [])[:14]
@@ -85,19 +102,47 @@ def run_spec_detective(
                 except Exception:
                     pass
 
+    revision_block = ""
+    if revising:
+        revision_block = (
+            "\n\nREVISION REQUIRED — Adversary found conflicts. Drop contradicted claims "
+            "(especially JWT/Bearer marketing). Keep/add supported runtime constraints "
+            "(default TTL 1800, opaque hex tokens, iOS X-Session-Token). "
+            "Do NOT reintroduce requirements Evidence contradicted.\n"
+            f"Prior specification:\n{json.dumps(prior_specification or [], indent=2)[:15000]}\n"
+            f"Conflicts:\n{json.dumps(conflicts or [], indent=2)[:12000]}\n"
+        )
+
     prompt = (
         f"Change request:\n{request}\n\n"
         f"Explorer findings:\n{json.dumps(explorer_findings, indent=2)[:20000]}\n\n"
         f"Code excerpts (line-numbered):\n"
         + "\n\n".join(f"### {p}\n{body}" for p, body in evidence_snippets.items())[:40000]
+        + revision_block
         + "\n\nProduce the specification JSON."
     )
 
     llm: LLMResult = complete(prompt, system=SYSTEM_PROMPT)
     metrics.add(llm)
 
-    requirements = _parse_requirements(llm.text, request, explorer_findings, evidence_snippets)
-    emit("spec_updated", {"count": len(requirements), "requirements": requirements})
+    requirements = _parse_requirements(
+        llm.text,
+        request,
+        explorer_findings,
+        evidence_snippets,
+        include_doc_overtrust=not revising,
+    )
+    if revising:
+        requirements = _ensure_hidden_constraints(requirements, evidence_snippets, request)
+    emit(
+        "spec_updated",
+        {
+            "count": len(requirements),
+            "requirements": requirements,
+            "spec_iteration": spec_iteration,
+            "revising": revising,
+        },
+    )
     return requirements
 
 
@@ -119,6 +164,8 @@ def _parse_requirements(
     request: str,
     explorer_findings: dict[str, Any],
     evidence_snippets: dict[str, str],
+    *,
+    include_doc_overtrust: bool = True,
 ) -> list[Requirement]:
     body = text.strip()
     if "```" in body:
@@ -141,10 +188,15 @@ def _parse_requirements(
                 conf = str(item.get("confidence") or "medium").lower()
                 if conf not in {"high", "medium", "low"}:
                     conf = "medium"
+                # On revisions, drop JWT marketing claims even if the LLM reintroduces them.
+                text_item = str(item.get("text") or "").strip()
+                if not include_doc_overtrust and re.search(r"\bjwt\b|bearer <jwt>|authorization:\s*bearer", text_item, re.I):
+                    if not re.search(r"not .{0,12}jwt|no jwt|reject.*jwt|opaque hex|period-free", text_item, re.I):
+                        continue
                 reqs.append(
                     Requirement(
                         id=str(item.get("id") or f"R{len(reqs)+1}"),
-                        text=str(item.get("text") or "").strip(),
+                        text=text_item,
                         evidence=evidence,
                         confidence=conf,  # type: ignore[arg-type]
                         status="proposed",
@@ -153,13 +205,55 @@ def _parse_requirements(
         except json.JSONDecodeError:
             pass
 
-    if reqs:
-        return _include_doc_overtrust(reqs, evidence_snippets)
+    if not reqs:
+        reqs = _fallback_requirements(request, explorer_findings, evidence_snippets)
 
-    return _include_doc_overtrust(
-        _fallback_requirements(request, explorer_findings, evidence_snippets),
-        evidence_snippets,
-    )
+    if include_doc_overtrust:
+        return _include_doc_overtrust(reqs, evidence_snippets)
+    return reqs
+
+
+def _ensure_hidden_constraints(
+    reqs: list[Requirement],
+    evidence_snippets: dict[str, str],
+    request: str,
+) -> list[Requirement]:
+    """After Adversary loop-back, lock in hidden remember-me contracts if missing."""
+    if "remember" not in request.lower():
+        return reqs
+    blob = " ".join(r["text"].lower() for r in reqs)
+    out = list(reqs)
+    idx = len(out) + 1
+
+    def add(text: str, evidence: list[str]) -> None:
+        nonlocal idx
+        out.append(
+            Requirement(
+                id=f"R{idx}",
+                text=text,
+                evidence=evidence,
+                confidence="high",
+                status="proposed",
+            )
+        )
+        idx += 1
+
+    if "1800" not in blob and "30 minute" not in blob and "30-minute" not in blob:
+        add(
+            "Default (non-remember-me) sessions must keep SESSION_TTL_SECONDS=1800 (30 minutes).",
+            _evidence_for(["lib/config.py", "lib/session.py"], evidence_snippets) or ["lib/config.py:2"],
+        )
+    if "hex" not in blob and "opaque" not in blob:
+        add(
+            "Session tokens must remain opaque hex identifiers (no JWT / dotted token format).",
+            _evidence_for(["lib/tokens.py"], evidence_snippets) or ["lib/tokens.py:7-9"],
+        )
+    if "ios" not in blob and "x-session-token" not in blob and "session-token" not in blob:
+        add(
+            "iOS clients must continue to send/receive tokens via X-Session-Token; dotted tokens are rejected.",
+            _evidence_for(["clients/ios_client.py"], evidence_snippets) or ["clients/ios_client.py:1-20"],
+        )
+    return out
 
 
 def _include_doc_overtrust(
