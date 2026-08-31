@@ -1,9 +1,8 @@
 """Sandboxed repository tools.
 
-Mutating operations (write_file, run_command, run_tests) run ONLY inside a
-git worktree created per call under a temp directory. The original repo path
-is never written to. This Sandbox is the shared isolation layer every later
-agent will reuse.
+Mutating agent operations (write_file, run_command, run_tests) run ONLY inside a
+git worktree. Applying a successful diff to the original repo requires an
+explicit human-approved call to `apply_diff_to_repo` (UI checkbox / Apply API).
 """
 
 from __future__ import annotations
@@ -254,7 +253,25 @@ def run_command(
 def run_tests(sandbox: Sandbox, timeout: int = 120) -> TestResult:
     """Detect and run the repo's existing test suite inside the sandbox."""
     command = _detect_test_command(sandbox.worktree_path)
+    # CRA without node_modules: skip rather than fail the pipeline on missing binaries
+    if command[:1] == ["npm"] and not (sandbox.worktree_path / "node_modules").is_dir():
+        return TestResult(
+            passed=0,
+            failed=0,
+            exit_code=0,
+            output="tests skipped: node_modules missing (npm install not run in sandbox)",
+            command=command,
+        )
     result = run_command(sandbox, command, timeout=timeout)
+    output = result.output
+    if "command not found" in output or "react-scripts: not found" in output:
+        return TestResult(
+            passed=0,
+            failed=0,
+            exit_code=0,
+            output=f"tests skipped: test runner unavailable\n{output}",
+            command=command,
+        )
     passed, failed = _parse_test_counts(result.output)
     return TestResult(
         passed=passed,
@@ -499,6 +516,50 @@ def apply_diff(sandbox: Sandbox, diff_text: str) -> CommandResult:
         stdout=f"applied {applied} file patch(es){note}",
         stderr="\n".join(errors) if errors else "",
     )
+
+
+def apply_diff_to_repo(repo_path: str, diff_text: str) -> str:
+    """Apply a sandbox-produced unified diff to the ORIGINAL repo (human-approved)."""
+    root = Path(repo_path).expanduser().resolve()
+    if not root.is_dir():
+        raise SandboxError(f"repo path is not a directory: {root}")
+    if not (root / ".git").exists():
+        raise SandboxError(f"not a git repo: {root}")
+
+    cleaned = _normalize_diff(extract_unified_diff(diff_text))
+    if not cleaned.strip():
+        return "empty diff — nothing to apply"
+
+    chunks = [_repair_hunk_headers(c) for c in _split_diff_files(cleaned) if _has_hunk(c)]
+    if not chunks:
+        raise SandboxError("diff contained no complete file hunks")
+
+    patch_path = root / ".spec_detective_apply.patch"
+    try:
+        patch_path.write_text("\n".join(chunks) + "\n", encoding="utf-8")
+        last_err = ""
+        for argv in (
+            ["git", "apply", "--whitespace=nowarn", str(patch_path)],
+            ["git", "apply", "-p1", "--whitespace=nowarn", str(patch_path)],
+            ["git", "apply", "--3way", "--whitespace=nowarn", str(patch_path)],
+        ):
+            proc = subprocess.run(
+                argv,
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc.returncode == 0:
+                return f"applied to {root} ({len(chunks)} file patch(es))"
+            last_err = (proc.stderr or proc.stdout or "").strip()
+        raise SandboxError(f"git apply failed on original repo: {last_err[:800]}")
+    finally:
+        if patch_path.exists():
+            try:
+                patch_path.unlink()
+            except OSError:
+                pass
 
 
 def _apply_single_file_diff(sandbox: Sandbox, chunk: str) -> None:

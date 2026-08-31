@@ -60,6 +60,35 @@ def run_adversary(
         },
     )
 
+    force = sandbox.worktree_path / "FORCE_SPEC_CONFLICT"
+    # Cleared after human Accept assumption OR Clarify & retry (both inject markers below)
+    human_cleared = (
+        "accept remaining assumptions" in request.lower()
+        or "human clarification:" in request.lower()
+        or "human checkpoint:" in request.lower()
+    )
+    if force.exists() and not human_cleared:
+        conflicts = [
+            {
+                "requirement_id": "FORCE",
+                "summary": "FORCE_SPEC_CONFLICT marker present — unresolved adversarial block",
+                "detail": force.read_text(encoding="utf-8", errors="replace")[:500],
+                "evidence": ["FORCE_SPEC_CONFLICT:1"],
+            }
+        ]
+        emit(
+            "conflict_found",
+            {
+                "agent": "adversary",
+                "spec_iteration": spec_iteration,
+                "requirement_id": "FORCE",
+                "summary": conflicts[0]["summary"],
+                "detail": conflicts[0]["detail"],
+                "evidence": conflicts[0]["evidence"],
+            },
+        )
+        return [{"kind": "force_block", "detail": "eval checkpoint case"}], conflicts
+
     excerpts: dict[str, str] = {}
     for term in (
         "remember_me",
