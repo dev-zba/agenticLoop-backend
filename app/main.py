@@ -1,4 +1,4 @@
-"""FastAPI app: baseline run + SSE events."""
+"""FastAPI app: baseline + pipeline runs + SSE events."""
 
 from __future__ import annotations
 
@@ -6,20 +6,21 @@ import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from app.baseline import BaselineResult, run_baseline
+from app.graph import PipelineResult, run_pipeline
 from app.security import sanitize_error_message
 
 load_dotenv()
 
-app = FastAPI(title="Spec Detective", version="0.1.0")
+app = FastAPI(title="Spec Detective", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -31,7 +32,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory run store. Fine for the local skeleton.
 RUNS: dict[str, dict[str, Any]] = {}
 
 
@@ -42,11 +42,12 @@ class RunRequest(BaseModel):
 
 class RunResponse(BaseModel):
     id: str
-    diff: str
-    tests_passed: int
-    tests_failed: int
-    runtime_seconds: float
-    token_cost: float
+    mode: str = "baseline"
+    diff: str = ""
+    tests_passed: int = 0
+    tests_failed: int = 0
+    runtime_seconds: float = 0.0
+    token_cost: float = 0.0
     test_output: str = ""
     model: str = ""
     input_tokens: int = 0
@@ -54,6 +55,14 @@ class RunResponse(BaseModel):
     files_in_context: list[str] = []
     error: str | None = None
     status: str = "completed"
+    specification: list[dict[str, Any]] = []
+    explorer_findings: dict[str, Any] = {}
+
+
+class RunStartedResponse(BaseModel):
+    id: str
+    mode: Literal["baseline", "pipeline"]
+    status: str = "running"
 
 
 @app.get("/health")
@@ -61,11 +70,55 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/runs", response_model=RunResponse)
-async def create_run(body: RunRequest) -> RunResponse:
+def _append_event(run_id: str, event_type: str, data: dict) -> None:
+    RUNS[run_id]["events"].append(
+        {
+            "type": event_type,
+            "data": data,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
+async def _execute_pipeline(run_id: str, repo_path: str, request: str) -> None:
+    def on_event(event_type: str, data: dict) -> None:
+        _append_event(run_id, event_type, data)
+
+    try:
+        result: PipelineResult = await asyncio.to_thread(run_pipeline, repo_path, request, on_event)
+        payload = {
+            "id": run_id,
+            "mode": "pipeline",
+            "status": result.status,
+            "runtime_seconds": result.runtime_seconds,
+            "token_cost": result.token_cost,
+            "model": result.model,
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "specification": result.specification,
+            "explorer_findings": result.explorer_findings,
+            "error": result.error,
+        }
+        RUNS[run_id]["status"] = result.status
+        RUNS[run_id]["result"] = payload
+        if result.error:
+            RUNS[run_id]["error"] = result.error
+    except Exception as exc:
+        safe = sanitize_error_message(str(exc))
+        RUNS[run_id]["status"] = "failed"
+        RUNS[run_id]["error"] = safe
+        _append_event(run_id, "run_completed", {"status": "failed", "error": safe})
+
+
+@app.post("/runs")
+async def create_run(
+    body: RunRequest,
+    mode: Literal["baseline", "pipeline"] = Query(default="baseline"),
+):
     run_id = str(uuid.uuid4())
     RUNS[run_id] = {
         "id": run_id,
+        "mode": mode,
         "status": "running",
         "repo_path": body.repo_path,
         "request": body.request,
@@ -73,14 +126,12 @@ async def create_run(body: RunRequest) -> RunResponse:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    if mode == "pipeline":
+        asyncio.create_task(_execute_pipeline(run_id, body.repo_path, body.request))
+        return RunStartedResponse(id=run_id, mode="pipeline", status="running")
+
     def on_event(event_type: str, data: dict) -> None:
-        RUNS[run_id]["events"].append(
-            {
-                "type": event_type,
-                "data": data,
-                "ts": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        _append_event(run_id, event_type, data)
 
     try:
         result: BaselineResult = await asyncio.to_thread(
@@ -90,17 +141,12 @@ async def create_run(body: RunRequest) -> RunResponse:
         safe = sanitize_error_message(str(exc))
         RUNS[run_id]["status"] = "failed"
         RUNS[run_id]["error"] = safe
-        RUNS[run_id]["events"].append(
-            {
-                "type": "completed",
-                "data": {"error": safe},
-                "ts": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        _append_event(run_id, "run_completed", {"status": "failed", "error": safe})
         raise HTTPException(status_code=500, detail=safe) from exc
 
     payload = RunResponse(
         id=run_id,
+        mode="baseline",
         diff=result.diff,
         tests_passed=result.tests_passed,
         tests_failed=result.tests_failed,
@@ -116,6 +162,11 @@ async def create_run(body: RunRequest) -> RunResponse:
     )
     RUNS[run_id]["status"] = "completed"
     RUNS[run_id]["result"] = payload.model_dump()
+    _append_event(
+        run_id,
+        "run_completed",
+        {"status": "completed", "mode": "baseline", "tests_passed": result.tests_passed},
+    )
     return payload
 
 
@@ -127,13 +178,23 @@ def get_run(run_id: str) -> dict[str, Any]:
     return run
 
 
+@app.get("/runs/{run_id}/results")
+def get_run_results(run_id: str) -> dict[str, Any]:
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    if run.get("status") == "running":
+        return {"id": run_id, "status": "running", "mode": run.get("mode", "pipeline")}
+    result = run.get("result") or {}
+    return {"id": run_id, "status": run.get("status"), **result}
+
+
 @app.get("/runs/{run_id}/events")
 async def run_events(run_id: str) -> EventSourceResponse:
     if run_id not in RUNS:
         raise HTTPException(status_code=404, detail="run not found")
 
     async def generator():
-        # Replay whatever we have (started / completed for this phase).
         sent = 0
         idle_rounds = 0
         while True:
@@ -149,10 +210,10 @@ async def run_events(run_id: str) -> EventSourceResponse:
                     "event": event["type"],
                     "data": json.dumps(event),
                 }
-            if run["status"] in {"completed", "failed"} and sent >= len(events):
+            if run["status"] in {"completed", "success", "failed"} and sent >= len(events):
                 break
             idle_rounds += 1
-            if idle_rounds > 600:
+            if idle_rounds > 1200:
                 break
             await asyncio.sleep(0.25)
 

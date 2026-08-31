@@ -264,6 +264,59 @@ def run_tests(sandbox: Sandbox, timeout: int = 120) -> TestResult:
     )
 
 
+def search_code(
+    sandbox: Sandbox,
+    pattern: str,
+    path: str = ".",
+    max_results: int = 40,
+) -> list[dict[str, str | int]]:
+    """Ripgrep search inside the sandbox worktree."""
+    result = run_command(
+        sandbox,
+        ["rg", "--json", "-n", "--max-count", str(max_results), pattern, path],
+        timeout=60,
+    )
+    hits: list[dict[str, str | int]] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "match":
+            continue
+        data = obj.get("data") or {}
+        hits.append(
+            {
+                "path": (data.get("path") or {}).get("text", ""),
+                "line": int(data.get("line_number") or 0),
+                "text": (data.get("lines") or {}).get("text", "").strip(),
+            }
+        )
+    return hits
+
+
+def git_history(sandbox: Sandbox, path: str = ".", max_commits: int = 10) -> str:
+    """Recent commit history for `path` inside the sandbox."""
+    result = run_command(
+        sandbox,
+        ["git", "log", f"-{max_commits}", "--oneline", "--", path],
+        timeout=30,
+    )
+    return result.stdout.strip()
+
+
+def inspect_dependencies(sandbox: Sandbox) -> dict[str, str]:
+    """Read dependency manifests present in the repo."""
+    deps: dict[str, str] = {}
+    for name in ("requirements.txt", "pyproject.toml", "package.json", "Pipfile"):
+        target = sandbox.worktree_path / name
+        if target.is_file():
+            deps[name] = target.read_text(encoding="utf-8", errors="replace")[:4000]
+    return deps
+
+
 def git_diff(sandbox: Sandbox) -> str:
     """Return the unified diff of sandbox changes against HEAD."""
     staged = run_command(sandbox, ["git", "add", "-A"])
@@ -275,38 +328,113 @@ def git_diff(sandbox: Sandbox) -> str:
     return diff.stdout
 
 
+def delete_file(sandbox: Sandbox, path: str) -> None:
+    """Remove a file inside the sandbox worktree only."""
+    target = sandbox.resolve(path)
+    if not target.exists():
+        return
+    if not _is_relative_to(target.resolve(), sandbox.worktree_path.resolve()):
+        raise SandboxError(f"delete_file refused path outside sandbox: {path}")
+    if target.is_dir():
+        raise SandboxError(f"delete_file refused directory: {path}")
+    target.unlink()
+
+
 def apply_diff(sandbox: Sandbox, diff_text: str) -> CommandResult:
     """Apply a unified diff inside the sandbox worktree."""
     cleaned = _normalize_diff(extract_unified_diff(diff_text))
     if not cleaned.strip():
         raise SandboxError("empty diff; nothing to apply")
-    patch_path = sandbox.root / "incoming.patch"
-    patch_path.write_text(cleaned, encoding="utf-8")
 
-    attempts = [
+    chunks = [_repair_hunk_headers(c) for c in _split_diff_files(cleaned) if _has_hunk(c)]
+    if not chunks:
+        raise SandboxError("diff contained no complete file hunks (possibly truncated)")
+
+    errors: list[str] = []
+    applied = 0
+    for chunk in chunks:
+        try:
+            _apply_single_file_diff(sandbox, chunk)
+            applied += 1
+        except SandboxError as exc:
+            errors.append(str(exc))
+
+    if applied == 0:
+        raise SandboxError(
+            "failed to apply diff.\n" + "\n".join(errors[:3]) + f"\n\ndiff:\n{chunks[0][:2000]}"
+        )
+
+    note = ""
+    skipped = len(_split_diff_files(cleaned)) - len(chunks)
+    if skipped:
+        note = f" (skipped {skipped} incomplete file section(s))"
+    if errors:
+        note += f" ({applied} applied, {len(errors)} failed)"
+
+    return CommandResult(
+        command=["apply_diff"],
+        exit_code=0,
+        stdout=f"applied {applied} file patch(es){note}",
+        stderr="\n".join(errors) if errors else "",
+    )
+
+
+def _apply_single_file_diff(sandbox: Sandbox, chunk: str) -> None:
+    patch_path = sandbox.root / "incoming.patch"
+    patch_path.write_text(chunk, encoding="utf-8")
+
+    for argv in (
         ["git", "apply", "--whitespace=nowarn", str(patch_path)],
         ["git", "apply", "-p1", "--whitespace=nowarn", str(patch_path)],
         ["git", "apply", "--3way", "--whitespace=nowarn", str(patch_path)],
-    ]
-    last: CommandResult | None = None
-    errors: list[str] = []
-    for argv in attempts:
-        last = run_command(sandbox, argv)
-        if last.ok:
-            return last
-        errors.append(f"$ {' '.join(argv)}\n{last.output}")
+    ):
+        result = run_command(sandbox, argv)
+        if result.ok:
+            return
 
-    try:
-        _apply_unified_diff_python(sandbox, cleaned)
-        return CommandResult(command=["python-hunk-apply"], exit_code=0, stdout="applied", stderr="")
-    except Exception as exc:
-        errors.append(f"python hunk apply: {exc}")
+    _apply_unified_diff_python(sandbox, chunk)
 
-    raise SandboxError(
-        "failed to apply diff with git apply / hunk parser.\n"
-        + "\n".join(errors)
-        + f"\n\ndiff:\n{cleaned[:4000]}"
-    )
+
+def _split_diff_files(text: str) -> list[str]:
+    """Split a multi-file unified diff into per-file chunks."""
+    lines = text.splitlines(keepends=True)
+    if not any(line.startswith("diff --git ") for line in lines):
+        return [text] if text.strip() else []
+
+    chunks: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        if line.startswith("diff --git ") and current:
+            chunks.append("".join(current))
+            current = [line]
+        elif line.startswith("diff --git "):
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
+def _has_hunk(chunk: str) -> bool:
+    return bool(re.search(r"^@@ ", chunk, flags=re.MULTILINE))
+
+
+def _repair_hunk_headers(chunk: str) -> str:
+    """Fix common LLM hunk header mistakes, e.g. `@@ -1 +0,0 @@` → `@@ -1,1 +0,0 @@`."""
+    out: list[str] = []
+    for line in chunk.splitlines():
+        m = re.match(r"^@@ -(\d+) \+(\d+),(\d+) @@(.*)$", line)
+        if m:
+            out.append(f"@@ -{m.group(1)},1 +{m.group(2)},{m.group(3)} @@{m.group(4)}")
+            continue
+        m = re.match(r"^@@ -(\d+),(\d+) \+(\d+) @@(.*)$", line)
+        if m:
+            out.append(f"@@ -{m.group(1)},{m.group(2)} +{m.group(3)},0 @@{m.group(4)}")
+            continue
+        out.append(line)
+    body = "\n".join(out)
+    return body + ("\n" if chunk.endswith("\n") else "")
 
 
 def _normalize_diff(text: str) -> str:
@@ -330,6 +458,8 @@ def _normalize_diff(text: str) -> str:
             out.append(f"diff --git a/{git_path} b/{git_path}")
             if old_raw in {"/dev/null", "a/dev/null"}:
                 out.append("new file mode 100644")
+            elif new_raw in {"/dev/null", "b/dev/null"}:
+                out.append("deleted file mode 100644")
             out.append(f"--- a/{old_path}" if old_path else "--- /dev/null")
             out.append(f"+++ b/{new_path}" if new_path else "+++ /dev/null")
             i += 2 if i + 1 < len(lines) and lines[i + 1].startswith("+++ ") else 1
@@ -351,7 +481,9 @@ def _strip_diff_path(raw: str) -> str:
 def _apply_unified_diff_python(sandbox: Sandbox, diff_text: str) -> None:
     """Apply unified-diff hunks without shelling out to `patch`."""
     files: dict[str, str] = {}
+    deletes: set[str] = set()
     current_path: str | None = None
+    delete_current = False
     hunk_old: list[str] = []
     hunk_new: list[str] = []
     in_hunk = False
@@ -369,20 +501,31 @@ def _apply_unified_diff_python(sandbox: Sandbox, diff_text: str) -> None:
         if not in_hunk or not current_path:
             hunk_old, hunk_new, in_hunk = [], [], False
             return
-        files[current_path] = _splice_hunk(load(current_path), "".join(hunk_old), "".join(hunk_new), current_path)
+        if delete_current:
+            deletes.add(current_path)
+        else:
+            files[current_path] = _splice_hunk(
+                load(current_path), "".join(hunk_old), "".join(hunk_new), current_path
+            )
         hunk_old, hunk_new, in_hunk = [], [], False
 
     for line in diff_text.splitlines(keepends=True):
         stripped = line.rstrip("\n")
         if stripped.startswith("diff --git "):
             flush_hunk()
+            delete_current = False
             continue
         if stripped.startswith("+++ "):
             flush_hunk()
-            path = _strip_diff_path(stripped[4:].strip())
+            new_raw = stripped[4:].strip().split("\t")[0]
+            path = _strip_diff_path(new_raw)
+            delete_current = new_raw in {"/dev/null", "b/dev/null", "dev/null"}
             current_path = path or current_path
             continue
         if stripped.startswith("--- ") or stripped.startswith("index ") or stripped.startswith("new file"):
+            continue
+        if stripped.startswith("deleted file"):
+            delete_current = True
             continue
         if stripped.startswith("@@"):
             flush_hunk()
@@ -403,10 +546,13 @@ def _apply_unified_diff_python(sandbox: Sandbox, diff_text: str) -> None:
             hunk_new.append(body + nl)
 
     flush_hunk()
-    if not files:
+    if not files and not deletes:
         raise SandboxError("diff contained no file paths")
     for path, content in files.items():
-        write_file(sandbox, path, content)
+        if path not in deletes:
+            write_file(sandbox, path, content)
+    for path in deletes:
+        delete_file(sandbox, path)
 
 
 def _splice_hunk(text: str, old: str, new: str, path: str) -> str:

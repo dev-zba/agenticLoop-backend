@@ -82,3 +82,47 @@ def test_apply_diff_tolerates_extra_blank_line_in_hunk(tmp_path: Path):
         updated = (sb.worktree_path / "greet.py").read_text(encoding="utf-8")
         assert "def farewell" in updated
         assert 'return f"Goodbye, {name}!"' in updated
+
+
+def test_apply_diff_repairs_malformed_hunk_header(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "CNAME").write_text("ashutoshhathidara.com\n", encoding="utf-8")
+
+    diff = """diff --git a/CNAME b/CNAME
+deleted file mode 100644
+index e234661..0000000
+--- a/CNAME
++++ /dev/null
+@@ -1 +0,0 @@
+-ashutoshhathidara.com
+"""
+    with Sandbox.create(repo) as sb:
+        apply_diff(sb, diff)
+        assert not (sb.worktree_path / "CNAME").exists()
+        assert not (repo / "CNAME").exists() or (repo / "CNAME").read_text() == "ashutoshhathidara.com\n"
+
+
+def test_apply_diff_skips_truncated_file_sections(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.txt").write_text("alpha\n", encoding="utf-8")
+    (repo / "b.txt").write_text("beta\n", encoding="utf-8")
+
+    diff = """diff --git a/a.txt b/a.txt
+index 1111111..2222222 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-alpha
++ALPHA
+diff --git a/b.txt b/b.txt
+index 3333333..4444444 100644
+--- a/b.txt
++++ b/b.txt
+"""
+    with Sandbox.create(repo) as sb:
+        result = apply_diff(sb, diff)
+        assert result.ok
+        assert (sb.worktree_path / "a.txt").read_text(encoding="utf-8") == "ALPHA\n"
+        assert (sb.worktree_path / "b.txt").read_text(encoding="utf-8") == "beta\n"

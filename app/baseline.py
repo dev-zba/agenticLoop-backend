@@ -40,8 +40,12 @@ MAX_TOTAL_BYTES = 40_000
 
 SYSTEM_PROMPT = """You are a careful software engineer applying one change to an existing repository.
 Implement ONLY the user's request. Prefer the smallest patch that satisfies it.
-Return a unified diff that `git apply` can consume (diff --git / --- / +++ hunks).
-Do not wrap the diff in commentary. Do not invent a new architecture if an existing module already owns the behavior.
+Return a complete unified diff that `git apply` can consume:
+- Use `diff --git a/path b/path` headers for every file
+- Use valid hunk headers like `@@ -1,3 +1,4 @@` (always include line counts)
+- Include every changed file fully — never truncate mid-file
+- Do not wrap the diff in commentary
+Do not invent a new architecture if an existing module already owns the behavior.
 """
 
 
@@ -207,8 +211,9 @@ def _build_prompt(request: str, context: str) -> str:
         f"{context}\n\n"
         "Change request:\n"
         f"{request}\n\n"
-        "Return a unified diff implementing this change against the files above. "
-        "Keep existing public contracts unless the request explicitly changes them.\n"
+        "Return a complete unified diff implementing this change. "
+        "Use valid `@@ -old,count +new,count @@` hunk headers. "
+        "Include full hunks for every file — do not truncate.\n"
     )
 
 
