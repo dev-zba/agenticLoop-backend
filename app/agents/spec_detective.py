@@ -67,7 +67,10 @@ def run_spec_detective(
 
     evidence_snippets: dict[str, str] = {}
     paths = list(explorer_findings.get("relevant_files") or [])[:14]
-    for path in paths:
+    for forced in ("src/portfolio.js", "src/containers/greeting/Greeting.js", "README.md"):
+        if forced not in paths:
+            paths.insert(0, forced)
+    for path in paths[:16]:
         emit("tool_call", {"agent": "spec_detective", "tool": "read_file", "args": {"path": path}})
         try:
             content = read_file(sandbox, path)
@@ -193,6 +196,18 @@ def _parse_requirements(
                 if not include_doc_overtrust and re.search(r"\bjwt\b|bearer <jwt>|authorization:\s*bearer", text_item, re.I):
                     if not re.search(r"not .{0,12}jwt|no jwt|reject.*jwt|opaque hex|period-free", text_item, re.I):
                         continue
+                if not include_doc_overtrust and re.search(
+                    r"issplash\s+to\s+true|issplash.{0,12}true.{0,40}(off|disable)|turn.{0,20}splash.{0,20}off.{0,40}true",
+                    text_item,
+                    re.I,
+                ):
+                    continue
+                if not include_doc_overtrust and re.search(
+                    r"readme.{0,40}enough|social.{0,40}(enough|greeting)|does not need to change",
+                    text_item,
+                    re.I,
+                ):
+                    continue
                 reqs.append(
                     Requirement(
                         id=str(item.get("id") or f"R{len(reqs)+1}"),
@@ -209,7 +224,60 @@ def _parse_requirements(
         reqs = _fallback_requirements(request, explorer_findings, evidence_snippets)
 
     if include_doc_overtrust:
-        return _include_doc_overtrust(reqs, evidence_snippets)
+        reqs = _include_doc_overtrust(reqs, evidence_snippets)
+        reqs = _include_portfolio_traps(reqs, evidence_snippets, request)
+        return reqs
+    return reqs
+
+
+def _include_portfolio_traps(
+    reqs: list[Requirement],
+    evidence_snippets: dict[str, str],
+    request: str,
+) -> list[Requirement]:
+    """Surface naive splash / README-only claims for Evidence+Adversary to contradict."""
+    portfolio = ""
+    for path, body in evidence_snippets.items():
+        if path.endswith("portfolio.js") or path == "src/portfolio.js":
+            portfolio = body
+            break
+    if "isSplash" not in portfolio and "greeting" not in portfolio:
+        return reqs
+
+    req_l = request.lower()
+    texts = " ".join(r["text"].lower() for r in reqs)
+
+    def add(text: str, evidence: list[str]) -> None:
+        reqs.append(
+            Requirement(
+                id=f"R{len(reqs) + 1}",
+                text=text,
+                evidence=evidence,
+                confidence="medium",
+                status="proposed",
+            )
+        )
+
+    if (
+        ("splash" in req_l or "issplash" in req_l.replace(" ", ""))
+        and re.search(r"issplash.{0,20}true|set(?:ting)?\s+issplash\s+to\s+true|splash.{0,40}true", req_l)
+        and not re.search(r"issplash.{0,20}true", texts)
+    ):
+        add(
+            "Turn the splash screen OFF by setting settings.isSplash to true in src/portfolio.js.",
+            ["src/portfolio.js:4-6"],
+        )
+
+    if (
+        ("readme" in req_l or "social" in req_l or "github" in req_l)
+        and re.search(r"enough|don.?t need|maybe you don.?t need|only.*(readme|social|github)", req_l)
+        and "portfolio.js" in "".join(evidence_snippets.keys())
+        and not re.search(r"readme.{0,40}enough|social.{0,40}greeting|without.{0,20}portfolio\.js", texts)
+    ):
+        add(
+            "Updating README banners and the Github social link label is enough for the home greeting title; src/portfolio.js greeting.title does not need to change.",
+            ["README.md:1-20", "src/portfolio.js:21-24"],
+        )
     return reqs
 
 

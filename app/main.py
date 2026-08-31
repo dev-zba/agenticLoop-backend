@@ -60,6 +60,8 @@ class RunResponse(BaseModel):
     evidence_report: dict[str, Any] = {}
     adversary_findings: list[dict[str, Any]] = []
     conflicts: list[dict[str, Any]] = []
+    rejected_requirements: list[dict[str, Any]] = []
+    revision_log: list[dict[str, Any]] = []
     spec_iteration: int = 0
     build_iteration: int = 0
 
@@ -105,6 +107,8 @@ async def _execute_pipeline(run_id: str, repo_path: str, request: str) -> None:
             "evidence_report": result.evidence_report,
             "adversary_findings": result.adversary_findings,
             "conflicts": result.conflicts,
+            "rejected_requirements": result.rejected_requirements,
+            "revision_log": result.revision_log,
             "diff": result.implementation_diff or "",
             "tests_passed": result.tests_passed,
             "tests_failed": result.tests_failed,

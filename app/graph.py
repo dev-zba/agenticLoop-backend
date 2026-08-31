@@ -23,6 +23,8 @@ from app.tools.repo_tools import Sandbox
 @dataclass
 class PipelineResult:
     specification: list[Requirement] = field(default_factory=list)
+    rejected_requirements: list[Requirement] = field(default_factory=list)
+    revision_log: list[dict[str, Any]] = field(default_factory=list)
     explorer_findings: dict[str, Any] = field(default_factory=dict)
     evidence_report: dict[str, Any] = field(default_factory=dict)
     adversary_findings: list[dict[str, Any]] = field(default_factory=list)
@@ -94,32 +96,67 @@ def build_graph(sandbox: Sandbox, emit: EventCallback, metrics: AgentMetrics):
             metrics,
             spec_iteration=iteration,
         )
-        return {
+        updates: dict[str, Any] = {
             "adversary_findings": findings,
             "conflicts": conflicts,
             "status": "running",
         }
+        if conflicts and iteration < MAX_SPEC_ITERATIONS:
+            log = list(state.get("revision_log") or [])
+            log.append(
+                {
+                    "from_iteration": iteration,
+                    "to_iteration": iteration + 1,
+                    "action": "sent_back_to_spec_detective",
+                    "conflicts": conflicts,
+                    "draft_snapshot": [
+                        {
+                            "id": r.get("id"),
+                            "text": r.get("text"),
+                            "status": r.get("status"),
+                            "evidence": r.get("evidence"),
+                        }
+                        for r in (state.get("specification") or [])
+                    ],
+                }
+            )
+            updates["revision_log"] = log
+        return updates
 
     def accept_spec_node(state: WorkflowState) -> dict[str, Any]:
         accepted: list[Requirement] = []
+        rejected: list[Requirement] = []
         for req in state.get("specification") or []:
             status = req.get("status")
             if status == "supported":
                 accepted.append({**req, "status": "accepted"})  # type: ignore[misc]
             elif status == "accepted":
                 accepted.append(req)
-            # Drop contradicted / insufficient from the implementable set.
+            else:
+                reason = {
+                    "contradicted": "Rejected — contradicted by repo evidence",
+                    "insufficient_evidence": "Rejected — insufficient evidence (not in repo)",
+                    "proposed": "Rejected — never verified",
+                }.get(str(status), f"Rejected — status={status}")
+                item = {**req, "status": status}
+                item["rejection_reason"] = reason  # type: ignore[typeddict-unknown-key]
+                rejected.append(item)  # type: ignore[arg-type]
         emit(
             "spec_updated",
             {
                 "count": len(accepted),
                 "requirements": accepted,
+                "rejected": rejected,
                 "source": "accepted",
                 "spec_iteration": state.get("spec_iteration"),
             },
         )
-        return {"specification": accepted, "status": "running", "conflicts": []}
-
+        return {
+            "specification": accepted,
+            "rejected_requirements": rejected,
+            "status": "running",
+            "conflicts": [],
+        }
     def builder_node(state: WorkflowState) -> dict[str, Any]:
         build_i = int(state.get("build_iteration") or 0) + 1
         result = run_builder(
@@ -164,6 +201,7 @@ def build_graph(sandbox: Sandbox, emit: EventCallback, metrics: AgentMetrics):
                 "next_iteration": iteration + 1,
                 "conflict_count": len(conflicts),
                 "label": f"↻ Spec Detective (iteration {iteration + 1})",
+                "conflicts": conflicts,
             },
         )
         return "spec_detective"
@@ -212,6 +250,8 @@ def run_pipeline(
         "evidence_report": {},
         "adversary_findings": [],
         "conflicts": [],
+        "rejected_requirements": [],
+        "revision_log": [],
         "implementation_diff": None,
         "verification": None,
         "spec_iteration": 0,
@@ -240,6 +280,8 @@ def run_pipeline(
         )
         return PipelineResult(
             specification=final.get("specification") or [],
+            rejected_requirements=list(final.get("rejected_requirements") or []),
+            revision_log=list(final.get("revision_log") or []),
             explorer_findings=final.get("explorer_findings") or {},
             evidence_report=final.get("evidence_report") or {},
             adversary_findings=list(final.get("adversary_findings") or []),

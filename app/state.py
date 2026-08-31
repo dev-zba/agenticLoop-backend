@@ -16,6 +16,8 @@ class WorkflowState(TypedDict):
     evidence_report: dict
     adversary_findings: list[dict]
     conflicts: list[dict]
+    rejected_requirements: list[Requirement]
+    revision_log: list[dict]
     implementation_diff: str | None
     verification: dict | None
     spec_iteration: int

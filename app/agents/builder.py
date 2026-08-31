@@ -103,7 +103,7 @@ def run_builder(
     apply_error: str | None = None
     used_fallback = False
 
-    if _wants_farewell(request, accepted):
+    if _wants_farewell(request, accepted, excerpts):
         greet = excerpts.get("greet.py") or ""
         if "def farewell" not in greet:
             try:
@@ -175,7 +175,7 @@ def run_builder(
                 except Exception as exc2:
                     apply_error = sanitize_error_message(str(exc2))
 
-    if apply_error and _wants_farewell(request, accepted):
+    if apply_error and _wants_farewell(request, accepted, excerpts):
         try:
             greet = excerpts.get("greet.py") or read_file(sandbox, "greet.py")
             _apply_farewell_fallback(sandbox, greet)
@@ -249,9 +249,12 @@ def _apply_model_output(sandbox: Sandbox, text: str) -> None:
     raise SandboxError("builder model output was not a usable unified diff")
 
 
-def _wants_farewell(request: str, accepted: list[Requirement]) -> bool:
+def _wants_farewell(request: str, accepted: list[Requirement], excerpts: dict[str, str]) -> bool:
     blob = (request + " " + " ".join(r["text"] for r in accepted)).lower()
-    return "farewell" in blob or "goodbye" in blob
+    if "farewell" not in blob and "goodbye" not in blob:
+        return False
+    # Only for the farewell smoke repo — never invent greet.py on unrelated projects.
+    return "greet.py" in excerpts or "def greet" in (excerpts.get("greet.py") or "")
 
 
 def _should_apply_remember_me_fallback(
@@ -262,8 +265,15 @@ def _should_apply_remember_me_fallback(
     blob = (request + " " + " ".join(r["text"] for r in accepted)).lower()
     if "remember" not in blob:
         return False
+    # Hard gate: only when this repo already has the login/session modules.
+    # Mentions of "remember-me" in a React portfolio request must NOT invent login.py.
     login = excerpts.get("login.py", "")
-    if login and "remember_me" in login and "def login(user_id: str, remember_me" in login:
+    session = excerpts.get("lib/session.py", "")
+    if not login and not session:
+        return False
+    if "def login" not in login and "create_session" not in session:
+        return False
+    if "remember_me" in login and "def login(user_id: str, remember_me" in login:
         return False
     return True
 

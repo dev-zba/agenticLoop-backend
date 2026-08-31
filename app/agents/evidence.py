@@ -47,6 +47,20 @@ _ALREADY_HAS_REMEMBER = re.compile(
     r"already (wired|implemented|accepts)|is already wired",
     re.I,
 )
+_ISSPLASH_TRUE_DISABLES = re.compile(
+    r"issplash\s+to\s+true|set(?:ting)?\s+issplash\s+to\s+true|"
+    r"splash.{0,40}off.{0,40}true|true.{0,40}(disable|turn off|off).{0,20}splash|"
+    r"turn.{0,30}splash.{0,20}off.{0,50}true",
+    re.I,
+)
+_README_ONLY_GREETING = re.compile(
+    r"readme.{0,60}(enough|sufficient|without).{0,40}(greeting|portfolio\.js|display)|"
+    r"(social|github).{0,40}(enough|sufficient).{0,40}(greeting|title|name)|"
+    r"portfolio\.js.{0,40}does not need|"
+    r"don.?t need to touch portfolio\.js|"
+    r"without.{0,20}(changing|touching).{0,20}portfolio\.js",
+    re.I,
+)
 
 
 def claims_jwt_runtime(text: str) -> bool:
@@ -114,6 +128,9 @@ def run_evidence(
         "tests/test_greet.py",
         "tests/test_login.py",
         "tests/test_legacy_ios_contract.py",
+        "src/portfolio.js",
+        "src/containers/greeting/Greeting.js",
+        "src/components/seoHeader/SeoHeader.js",
     ):
         if path not in file_excerpts:
             _load_file(sandbox, path, emit, file_excerpts, optional=True)
@@ -276,15 +293,22 @@ def _apply_deterministic_traps(
     excerpts: dict[str, str],
     report: dict[str, Any],
 ) -> list[Requirement]:
-    """Catch over-trust of README / REMEMBER_ME_USES_JWT against runtime code."""
+    """Catch over-trust of README / REMEMBER_ME_USES_JWT / portfolio splash polarity."""
     tokens = excerpts.get("lib/tokens.py", "")
     ios = excerpts.get("clients/ios_client.py", "")
     config = excerpts.get("lib/config.py", "")
     login = excerpts.get("login.py", "")
+    portfolio = ""
+    for path, body in excerpts.items():
+        if path.endswith("portfolio.js"):
+            portfolio = body
+            break
     hex_runtime = ".hex()" in tokens or "urandom" in tokens
     ios_rejects_dot = "JWT_HINT" in ios or 'raise ValueError' in ios
     ttl_1800 = "SESSION_TTL_SECONDS = 1800" in config or "SESSION_TTL_SECONDS=1800" in config.replace(" ", "")
     login_no_remember = "def login(user_id: str)" in login and "remember_me" not in login.split("def login", 1)[-1][:80]
+    splash_comment = "isSplash" in portfolio
+    greeting_in_portfolio = "greeting" in portfolio and "title:" in portfolio
 
     out: list[Requirement] = []
     for req in requirements:
@@ -308,6 +332,14 @@ def _apply_deterministic_traps(
             status = "contradicted"
             evidence = ["login.py:12-14"]
             flipped = "login(user_id) has no remember_me parameter despite docs/flags"
+        elif _ISSPLASH_TRUE_DISABLES.search(text) and splash_comment:
+            status = "contradicted"
+            evidence = ["src/portfolio.js:4-6"]
+            flipped = "Comment says set isSplash to false to disable splash; true keeps splash ON"
+        elif _README_ONLY_GREETING.search(text) and greeting_in_portfolio:
+            status = "contradicted"
+            evidence = ["src/portfolio.js:21-30", "src/containers/greeting/Greeting.js:17-18"]
+            flipped = "Home greeting title is driven by greeting.title in portfolio.js, not README/social labels"
 
         req = {**req, "status": status, "evidence": evidence}  # type: ignore[misc]
         out.append(req)  # type: ignore[arg-type]
