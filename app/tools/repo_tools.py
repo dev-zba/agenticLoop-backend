@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+from functools import lru_cache
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -264,18 +265,78 @@ def run_tests(sandbox: Sandbox, timeout: int = 120) -> TestResult:
     )
 
 
+TEXT_SEARCH_SUFFIXES = {
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".json",
+    ".md",
+    ".txt",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".css",
+    ".scss",
+    ".html",
+    ".xml",
+    ".svg",
+    ".env",
+    ".ini",
+    ".cfg",
+    ".sh",
+    ".sql",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".rb",
+    ".php",
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".swift",
+}
+
+
+@lru_cache(maxsize=1)
+def _rg_executable() -> str | None:
+    return shutil.which("rg")
+
+
 def search_code(
     sandbox: Sandbox,
     pattern: str,
     path: str = ".",
     max_results: int = 40,
 ) -> list[dict[str, str | int]]:
-    """Ripgrep search inside the sandbox worktree."""
+    """Search code inside the sandbox worktree (ripgrep when available, else Python)."""
+    rg = _rg_executable()
+    if rg:
+        try:
+            return _search_code_ripgrep(sandbox, rg, pattern, path, max_results)
+        except (FileNotFoundError, OSError, SandboxError):
+            pass
+    return _search_code_python(sandbox, pattern, path, max_results)
+
+
+def _search_code_ripgrep(
+    sandbox: Sandbox,
+    rg: str,
+    pattern: str,
+    path: str,
+    max_results: int,
+) -> list[dict[str, str | int]]:
     result = run_command(
         sandbox,
-        ["rg", "--json", "-n", "--max-count", str(max_results), pattern, path],
+        [rg, "--json", "-n", "--max-count", str(max_results), pattern, path],
         timeout=60,
     )
+    if result.exit_code not in (0, 1):
+        raise SandboxError(result.stderr.strip() or f"rg exited {result.exit_code}")
+
     hits: list[dict[str, str | int]] = []
     for line in result.stdout.splitlines():
         if not line.strip():
@@ -295,6 +356,67 @@ def search_code(
             }
         )
     return hits
+
+
+def _search_code_python(
+    sandbox: Sandbox,
+    pattern: str,
+    path: str,
+    max_results: int,
+) -> list[dict[str, str | int]]:
+    """Line scan fallback when ripgrep is not installed."""
+    if not pattern.strip():
+        return []
+
+    try:
+        needle = re.compile(pattern)
+    except re.error:
+        needle = re.compile(re.escape(pattern))
+
+    start = sandbox.resolve(path)
+    if not start.exists():
+        return []
+
+    files: list[Path]
+    if start.is_file():
+        files = [start]
+    else:
+        files = []
+        for dirpath, dirnames, filenames in os.walk(start):
+            dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS and not d.startswith(".")]
+            for name in filenames:
+                if name.startswith(".") and name not in {"gitignore", ".env.example"}:
+                    continue
+                candidate = Path(dirpath) / name
+                if _is_text_search_candidate(candidate):
+                    files.append(candidate)
+
+    hits: list[dict[str, str | int]] = []
+    for file_path in files:
+        if len(hits) >= max_results:
+            return hits
+        try:
+            rel = _rel(sandbox, file_path)
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "\x00" in content[:4096]:
+            continue
+        for line_no, line in enumerate(content.splitlines(), start=1):
+            if needle.search(line):
+                hits.append({"path": rel, "line": line_no, "text": line.strip()})
+                if len(hits) >= max_results:
+                    return hits
+    return hits
+
+
+def _is_text_search_candidate(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    if suffix in TEXT_SEARCH_SUFFIXES:
+        return True
+    if not suffix:
+        return True
+    return False
 
 
 def git_history(sandbox: Sandbox, path: str = ".", max_commits: int = 10) -> str:

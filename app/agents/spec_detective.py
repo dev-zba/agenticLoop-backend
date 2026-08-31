@@ -64,7 +64,14 @@ def run_spec_detective(
 
     for term in ("SESSION_TTL", "remember", "token", "ios", "hex", "login"):
         emit("tool_call", {"agent": "spec_detective", "tool": "search_code", "args": {"pattern": term}})
-        hits = search_code(sandbox, term, max_results=12)
+        try:
+            hits = search_code(sandbox, term, max_results=12)
+        except Exception as exc:
+            emit(
+                "tool_result",
+                {"agent": "spec_detective", "tool": "search_code", "summary": f"{term}: error: {exc}"},
+            )
+            continue
         emit(
             "tool_result",
             {"agent": "spec_detective", "tool": "search_code", "summary": f"{term}: {len(hits)} hits"},
@@ -147,9 +154,48 @@ def _parse_requirements(
             pass
 
     if reqs:
-        return reqs
+        return _include_doc_overtrust(reqs, evidence_snippets)
 
-    return _fallback_requirements(request, explorer_findings, evidence_snippets)
+    return _include_doc_overtrust(
+        _fallback_requirements(request, explorer_findings, evidence_snippets),
+        evidence_snippets,
+    )
+
+
+def _include_doc_overtrust(
+    reqs: list[Requirement],
+    evidence_snippets: dict[str, str],
+) -> list[Requirement]:
+    """Surface README / REMEMBER_ME_USES_JWT claims Spec Detective may omit.
+
+    These are naive, documentation-backed proposals the Evidence agent must
+    independently contradict against runtime hex tokens + iOS header contract.
+    """
+    login_snip = ""
+    readme_snip = ""
+    for path, body in evidence_snippets.items():
+        if path.endswith("login.py"):
+            login_snip = body
+        if path.endswith("README.md"):
+            readme_snip = body
+    if "REMEMBER_ME_USES_JWT" not in login_snip and "JWT" not in readme_snip:
+        return reqs
+    if any(re.search(r"\bjwt\b|bearer", r["text"], re.I) for r in reqs):
+        return reqs
+    next_id = f"R{len(reqs) + 1}"
+    reqs.append(
+        Requirement(
+            id=next_id,
+            text=(
+                "Remember-me sessions should return JWT tokens (Authorization: Bearer), "
+                "as documented by REMEMBER_ME_USES_JWT and the README product brief."
+            ),
+            evidence=["login.py:7-9", "README.md:15-20"],
+            confidence="medium",
+            status="proposed",
+        )
+    )
+    return reqs
 
 
 def _fallback_requirements(

@@ -57,6 +57,7 @@ class RunResponse(BaseModel):
     status: str = "completed"
     specification: list[dict[str, Any]] = []
     explorer_findings: dict[str, Any] = {}
+    evidence_report: dict[str, Any] = {}
 
 
 class RunStartedResponse(BaseModel):
@@ -97,6 +98,7 @@ async def _execute_pipeline(run_id: str, repo_path: str, request: str) -> None:
             "output_tokens": result.output_tokens,
             "specification": result.specification,
             "explorer_findings": result.explorer_findings,
+            "evidence_report": result.evidence_report,
             "error": result.error,
         }
         RUNS[run_id]["status"] = result.status

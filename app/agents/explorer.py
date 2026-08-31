@@ -232,6 +232,11 @@ def _normalize_findings(
         relevant_configs.append("lib/config.py: SESSION_TTL_SECONDS = 1800")
     if "lib/tokens.py" in file_contents and not any("hex" in f.lower() for f in facts):
         facts.append("lib/tokens.py issues opaque hex session tokens via os.urandom(...).hex()")
+    if "login.py" in file_contents and "REMEMBER_ME_USES_JWT" in file_contents.get("login.py", ""):
+        facts.append(
+            "login.py defines REMEMBER_ME_USES_JWT = True and README product copy claims JWT remember-me; "
+            "treat this as a documented claim to verify, not as proven runtime behavior"
+        )
     if "clients/ios_client.py" in file_contents and not any("ios" in f.lower() for f in facts):
         facts.append("clients/ios_client.py defines an iOS session header contract")
 

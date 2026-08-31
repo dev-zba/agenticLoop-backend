@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from app.tools.repo_tools import Sandbox, apply_diff, git_diff, run_command, write_file
+from app.tools.repo_tools import Sandbox, apply_diff, git_diff, run_command, search_code, write_file
 
 
 def test_write_file_does_not_mutate_original(tmp_path: Path):
@@ -126,3 +126,17 @@ index 3333333..4444444 100644
         assert result.ok
         assert (sb.worktree_path / "a.txt").read_text(encoding="utf-8") == "ALPHA\n"
         assert (sb.worktree_path / "b.txt").read_text(encoding="utf-8") == "beta\n"
+
+
+def test_search_code_python_fallback_without_rg(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "hello.py").write_text('NAME = "Zainab"\nprint("hello")\n', encoding="utf-8")
+    (repo / "readme.md").write_text("# portfolio\n", encoding="utf-8")
+
+    monkeypatch.setattr("app.tools.repo_tools._rg_executable", lambda: None)
+
+    with Sandbox.create(repo) as sb:
+        hits = search_code(sb, "Zainab")
+        assert any(h["path"] == "hello.py" and h["line"] == 1 for h in hits)
+        assert search_code(sb, "missing-token-xyz") == []

@@ -1,4 +1,4 @@
-"""LangGraph orchestration: Explorer → Spec Detective."""
+"""LangGraph orchestration: Explorer → Spec Detective → Evidence."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from langgraph.graph import END, StateGraph
 from app.agents.events import EventCallback, noop_event
 from app.agents.explorer import run_explorer
 from app.agents.metrics import AgentMetrics
+from app.agents.evidence import run_evidence
 from app.agents.spec_detective import run_spec_detective
 from app.security import sanitize_error_message
 from app.state import Requirement, WorkflowState
@@ -21,6 +22,7 @@ from app.tools.repo_tools import Sandbox
 class PipelineResult:
     specification: list[Requirement] = field(default_factory=list)
     explorer_findings: dict[str, Any] = field(default_factory=dict)
+    evidence_report: dict[str, Any] = field(default_factory=dict)
     runtime_seconds: float = 0.0
     token_cost: float = 0.0
     model: str = ""
@@ -45,13 +47,29 @@ def build_graph(sandbox: Sandbox, emit: EventCallback, metrics: AgentMetrics):
             emit,
             metrics,
         )
-        return {"specification": spec, "status": "success", "spec_iteration": 1}
+        return {"specification": spec, "spec_iteration": 1}
+
+    def evidence_node(state: WorkflowState) -> dict[str, Any]:
+        spec, report = run_evidence(
+            state["request"],
+            state.get("specification") or [],
+            sandbox,
+            emit,
+            metrics,
+        )
+        return {
+            "specification": spec,
+            "evidence_report": report,
+            "status": "success",
+        }
 
     graph.add_node("explorer", explorer_node)
     graph.add_node("spec_detective", spec_detective_node)
+    graph.add_node("evidence", evidence_node)
     graph.set_entry_point("explorer")
     graph.add_edge("explorer", "spec_detective")
-    graph.add_edge("spec_detective", END)
+    graph.add_edge("spec_detective", "evidence")
+    graph.add_edge("evidence", END)
     return graph.compile()
 
 
@@ -96,6 +114,7 @@ def run_pipeline(
         return PipelineResult(
             specification=final.get("specification") or [],
             explorer_findings=final.get("explorer_findings") or {},
+            evidence_report=final.get("evidence_report") or {},
             runtime_seconds=round(runtime, 3),
             token_cost=round(metrics.cost_usd, 6),
             model=metrics.model,
