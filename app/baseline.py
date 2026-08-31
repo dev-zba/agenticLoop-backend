@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.llm import LLMResult, complete
+from app.security import sanitize_error_message
 from app.tools.repo_tools import (
     Sandbox,
     SandboxError,
@@ -83,7 +84,7 @@ def run_baseline(
             llm = complete(prompt, system=SYSTEM_PROMPT)
             _apply_model_output(sandbox, llm.text)
         except Exception as exc:
-            apply_error = str(exc)
+            apply_error = sanitize_error_message(str(exc))
 
         diff = ""
         try:

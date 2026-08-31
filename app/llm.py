@@ -7,15 +7,23 @@ Supports Anthropic, OpenAI, and Gemini. The first configured API key wins
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 
 import httpx
 from dotenv import load_dotenv
 
+from app.security import sanitize_error_message
+
 load_dotenv()
 
 # USD per 1M tokens: (input, output). Used for the cost-per-task metric.
 PRICES_PER_MILLION: dict[str, tuple[float, float]] = {
+    "gemini-flash-latest": (0.30, 2.50),
+    "gemini-flash-lite-latest": (0.10, 0.40),
+    "gemini-3.5-flash": (0.30, 2.50),
+    "gemini-3.5-flash-lite": (0.10, 0.40),
+    "gemini-3.1-flash-lite": (0.10, 0.40),
     "gemini-2.5-flash": (0.30, 2.50),
     "gemini-2.5-flash-lite": (0.10, 0.40),
     "gemini-2.0-flash": (0.10, 0.40),
@@ -26,6 +34,16 @@ PRICES_PER_MILLION: dict[str, tuple[float, float]] = {
     "gpt-4o": (2.50, 10.00),
     "gpt-4o-mini": (0.15, 0.60),
 }
+
+# Transient Gemini errors — retry with backoff, then try fallback models.
+GEMINI_RETRYABLE_STATUS = {429, 502, 503, 504}
+GEMINI_MAX_RETRIES = 4
+GEMINI_RETRY_BASE_SEC = 2.0
+GEMINI_FALLBACK_MODELS = (
+    "gemini-flash-lite-latest",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+)
 
 
 @dataclass
@@ -48,7 +66,7 @@ def complete(prompt: str, system: str | None = None, timeout: float = 180.0) -> 
         model = model or "gpt-4o"
         return _openai(prompt, system, model, timeout)
     if provider == "gemini":
-        model = model or "gemini-2.5-flash"
+        model = model or "gemini-flash-lite-latest"
         return _gemini(prompt, system, model, timeout)
     raise RuntimeError(
         "No LLM API key found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY."
@@ -127,6 +145,34 @@ def _openai(prompt: str, system: str | None, model: str, timeout: float) -> LLMR
 
 
 def _gemini(prompt: str, system: str | None, model: str, timeout: float) -> LLMResult:
+    models = _gemini_model_chain(model)
+    last_error: RuntimeError | None = None
+
+    for candidate in models:
+        try:
+            return _gemini_once(prompt, system, candidate, timeout)
+        except RuntimeError as exc:
+            last_error = exc
+            msg = str(exc).lower()
+            # Try next model on capacity/not-found; stop on auth or bad request.
+            if "404" in str(exc) or "high demand" in msg or "http 503" in msg or "http 429" in msg:
+                continue
+            raise
+
+    raise last_error or RuntimeError("All Gemini models failed. Try again in a few minutes.")
+
+
+def _gemini_model_chain(primary: str) -> list[str]:
+    chain = [primary]
+    env_extra = os.getenv("GEMINI_FALLBACK_MODELS", "")
+    extras = [m.strip() for m in env_extra.split(",") if m.strip()]
+    for model in (*GEMINI_FALLBACK_MODELS, *extras):
+        if model not in chain:
+            chain.append(model)
+    return chain
+
+
+def _gemini_once(prompt: str, system: str | None, model: str, timeout: float) -> LLMResult:
     api_key = os.environ["GEMINI_API_KEY"]
     payload: dict = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -135,10 +181,32 @@ def _gemini(prompt: str, system: str | None, model: str, timeout: float) -> LLMR
     if system:
         payload["systemInstruction"] = {"parts": [{"text": system}]}
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
     with httpx.Client(timeout=timeout) as client:
-        resp = client.post(url, params={"key": api_key}, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        resp: httpx.Response | None = None
+        for attempt in range(GEMINI_MAX_RETRIES):
+            resp = client.post(
+                url,
+                headers={"x-goog-api-key": api_key, "content-type": "application/json"},
+                json=payload,
+            )
+            if resp.is_success:
+                break
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    f"Gemini model '{model}' not found or retired (404). "
+                    "Set MODEL_NAME=gemini-flash-lite-latest in backend/.env"
+                )
+            if resp.status_code in GEMINI_RETRYABLE_STATUS and attempt < GEMINI_MAX_RETRIES - 1:
+                time.sleep(GEMINI_RETRY_BASE_SEC * (2**attempt))
+                continue
+            detail = _gemini_error_detail(resp)
+            raise RuntimeError(
+                sanitize_error_message(f"Gemini request failed (HTTP {resp.status_code}): {detail}")
+            )
+
+    assert resp is not None and resp.is_success
+    data = resp.json()
     candidates = data.get("candidates") or []
     if not candidates:
         raise RuntimeError(f"Gemini returned no candidates: {data}")
@@ -148,3 +216,11 @@ def _gemini(prompt: str, system: str | None, model: str, timeout: float) -> LLMR
     inp = int(usage.get("promptTokenCount") or 0)
     out = int(usage.get("candidatesTokenCount") or 0)
     return LLMResult(text=text, model=model, input_tokens=inp, output_tokens=out, cost_usd=estimate_cost(model, inp, out))
+
+
+def _gemini_error_detail(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+        return str(body.get("error", {}).get("message") or resp.reason_phrase or "unknown error")
+    except Exception:
+        return resp.reason_phrase or "unknown error"

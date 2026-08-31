@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from app.baseline import BaselineResult, run_baseline
+from app.security import sanitize_error_message
 
 load_dotenv()
 
@@ -86,16 +87,17 @@ async def create_run(body: RunRequest) -> RunResponse:
             run_baseline, body.repo_path, body.request, on_event
         )
     except Exception as exc:
+        safe = sanitize_error_message(str(exc))
         RUNS[run_id]["status"] = "failed"
-        RUNS[run_id]["error"] = str(exc)
+        RUNS[run_id]["error"] = safe
         RUNS[run_id]["events"].append(
             {
                 "type": "completed",
-                "data": {"error": str(exc)},
+                "data": {"error": safe},
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
         )
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=safe) from exc
 
     payload = RunResponse(
         id=run_id,
