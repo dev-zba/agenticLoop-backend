@@ -324,6 +324,10 @@ def _apply_deterministic_traps(
                 "clients/ios_client.py:11-16",
             ]
             flipped = "runtime hex tokens + iOS period rejection contradict JWT/Bearer claims"
+        elif claims_jwt_runtime(text) and portfolio and not login.strip():
+            status = "insufficient_evidence"
+            evidence = ["src/portfolio.js:1-30"]
+            flipped = "No login/JWT/auth modules exist in this React portfolio — reject JWT ask"
         elif _DEFAULT_30_DAYS.search(text) and ttl_1800:
             status = "contradicted"
             evidence = ["lib/config.py:2", "lib/session.py:19-25"]

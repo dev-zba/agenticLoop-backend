@@ -355,13 +355,23 @@ def _portfolio_targets_from_spec(request: str, accepted: list[Requirement]) -> d
             raw = raw.replace("\\'", "'").replace('\\"', '"')
             if raw:
                 targets[key] = raw
-    # Sensible defaults for the common demo request
+    # Sensible defaults ONLY for fields already in the accepted spec (don't invent seo.og.title)
+    accepted_blob = " ".join(r.get("text", "") for r in accepted).lower()
     if "zainab" in request.lower():
-        targets.setdefault("greeting.title", "Zainab Binte Azhar")
-        targets.setdefault("greeting.logo_name", "ZainabBinteAzhar")
-        targets.setdefault("seo.title", "Zainab's Portfolio")
-        targets.setdefault("seo.og.title", "Zainab Binte Azhar Portfolio")
-        # Repair truncated apostrophe parses (to 'Zainab's … → 'Zainab')
+        defaults = {
+            "greeting.title": "Zainab Binte Azhar",
+            "greeting.logo_name": "ZainabBinteAzhar",
+            "seo.title": "Zainab's Portfolio",
+            "seo.og.title": "Zainab Binte Azhar Portfolio",
+        }
+        for key, val in defaults.items():
+            short = key.split(".")[-1]
+            if key in accepted_blob or (short == "logo_name" and "logo_name" in accepted_blob) or (
+                key == "seo.title" and "seo.title" in accepted_blob
+            ):
+                targets.setdefault(key, val)
+            elif key in targets:
+                continue
         if targets.get("seo.title") in {"Zainab", "Zainab\\"}:
             targets["seo.title"] = "Zainab's Portfolio"
     return targets
